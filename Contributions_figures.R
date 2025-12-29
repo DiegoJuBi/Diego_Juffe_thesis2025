@@ -1,3 +1,4 @@
+# This is a script created by Diego Juffe to plot the results of contributions to Potential Impact Intensity Index in Chapter 4 of his PhD thesis. Script developed through August-September 2025.
 # ---- packages ----
 if (!requireNamespace("tidyverse", quietly = TRUE)) install.packages("tidyverse")
 library(tidyverse)
@@ -86,3 +87,4 @@ output_file <- file.path(output_dir, paste0("fig_", TOP_N, "_", csv_name, ".png"
 
 ggsave(output_file, fig1, width = 10, height = png_height, dpi = 300)
 cat("??? Saved plot to:", output_file, "\n")
+
