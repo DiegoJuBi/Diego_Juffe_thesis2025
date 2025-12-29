@@ -1,1 +1,973 @@
-https://code.earthengine.google.com/?scriptPath=users%2FDiegoJuffe74%2Ftests%3A00_THESIS_FINAL%2FFINAL_with_Sensitivity_analysis
+Below is a cut and paste of the script located here: https://code.earthengine.google.com/?scriptPath=users%2FDiegoJuffe74%2Ftests%3A00_THESIS_FINAL%2FFINAL_with_Sensitivity_analysis
+
+/***** SENSITIVITY HEADER (drop-in; tweak these per run) *****/
+
+// Pick ONE setup per run
+var SENS = {
+  maxDist_m    : 15000,   // 15000 | 25000 | 50000
+  slope_deg    : 20,      // 10 | 20 | 30
+  work_scale_m : 250,     // 100 | 250 | 500
+
+  // Decay choice:
+  //   "fixed"      -> use k_fixed exactly
+  //   "tail_fixed" -> compute k so value at maxDist equals tail_e
+  k_mode       : "tail_fixed",             // "fixed" | "tail_fixed"
+  k_fixed      : 0.000307011345732539,     // use when k_mode === "fixed"
+  tail_e       : 0.01,                     // use when k_mode === "tail_fixed"
+
+  // Optional custom label; if null a compact tag is auto-built
+  tag          : null
+};
+
+// Handy fixed k’s (if you switch to k_mode:"fixed")
+var K_15km = 0.000307011345732539;
+var K_25km = 0.000184206807439523;
+var K_50km = 0.000138155105579642;
+
+// Build a compact tag like md15k_s20_r250_e0p01 or md50k_s10_r100_k50km
+(function buildSensTag(){
+  if (SENS.tag == null) {
+    var kTag = (SENS.k_mode === 'fixed')
+      ? ('k' + (SENS.maxDist_m/1000) + 'km')
+      : ('e' + String(SENS.tail_e).replace('.','p'));
+    SENS.tag = [
+      'md' + (SENS.maxDist_m/1000) + 'k',
+      's'  + SENS.slope_deg,
+      'r'  + SENS.work_scale_m,
+      kTag
+    ].join('_');
+  }
+  print('SENS tag:', SENS.tag);
+})();
+
+// Export helper that appends the tag automatically
+function X(name, collection, folder, fileFormat){
+  Export.table.toDrive({
+    collection : collection,
+    description: name + '_' + SENS.tag,
+    folder     : folder || 'GEE_Exports',
+    fileFormat : fileFormat || 'CSV'
+  });
+}
+
+/* =============================
+ * ======= LOAD DATA ===========
+ * ============================= */
+
+var allProjects = ee.FeatureCollection(proj);     // projects (expects 'Project_co')
+var slope       = ee.Terrain.slope(dem);          // DEM
+var WDPA        = ee.FeatureCollection(WDPA_Afr); // WDPA Africa
+var LSIB        = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+                    .filter(ee.Filter.eq('wld_rgn', 'Africa'));
+print('WDPA_Afr fields:', ee.Feature(ee.FeatureCollection(WDPA_Afr).first()).propertyNames());
+// --- SENS wiring (was: var maxDist=15000; var WORK_SCALE=250; obstacles slope.gt(20); k=const) ---
+var maxDist    = SENS.maxDist_m;          // meters
+var WORK_PROJ  = ee.ImageCollection('MODIS/061/MOD13Q1').first().projection(); // MODIS Sinusoidal (equal-area, meters)
+var WORK_SCALE = SENS.work_scale_m;       // meters
+var obstacles  = slope.gt(SENS.slope_deg);
+
+// decide k from SENS choice
+var k = (SENS.k_mode === 'fixed')
+  ? SENS.k_fixed
+  : (-Math.log(SENS.tail_e) / maxDist);
+
+// shared decay constants from (maxDist, k)
+var decayAtMax  = Math.exp(-k * maxDist);
+var scaleFactor = 1 / (1 - decayAtMax);
+
+// (optional) print exact numeric params for this run
+print('RUN PARAMS →',
+  'maxDist_m:', maxDist,
+  'slope_deg:', SENS.slope_deg,
+  'work_scale_m:', WORK_SCALE,
+  'k_mode:', SENS.k_mode,
+  'k:', k);
+
+var africaRegion = ee.Geometry.Rectangle([-20, -40, 60, 40]);
+
+/* =============================
+ * === COST SURFACE SETUP =====
+ * ============================= */
+
+var costSurface = ee.Image(1)
+  .updateMask(obstacles.not())
+  .reproject({ crs: WORK_PROJ, scale: WORK_SCALE });
+
+/* =============================
+ * === USER OPTIONS ============
+ * ============================= */
+
+var USE_ALL_PROJECTS        = true;
+var SELECTED_PROJECT_CODES  = ['LAP0002','LAP0003','LAP0004','LAP0005','LAP0006','LAP0020'];
+
+var MEAN_THRESH   = 0.05;  // For MEANS
+var AFFECT_THRESH = 0.0;   // For COVERAGE
+
+var projectCodes = allProjects.aggregate_array('Project_co').distinct().sort();
+var codesToUse = ee.List(ee.Algorithms.If(
+  USE_ALL_PROJECTS, projectCodes, ee.List(SELECTED_PROJECT_CODES)
+));
+
+// TEST subsets
+var TEST_N = 20;  // controls all TEST exports
+var testCodes     = ee.List(codesToUse).slice(0, TEST_N); //this one pick the first 5
+
+/* =============================
+ * === ID / FIELD SETTINGS  ====
+ * ============================= */
+
+var WDPA_KEEP_FIELDS = ['WDPAID','NAME','DESIG_ENG','DESIG_TYPE','ISO3','IUCN_CAT'];
+var COUNTRY_NAME_FIELD = 'country_na';
+
+/* =============================
+ * === HELPERS (ordering etc) ==
+ * ============================= */
+
+var STAT_PROJ  = ee.Projection(WORK_PROJ).atScale(WORK_SCALE);
+var PIXEL_AREA = ee.Image.pixelArea().divide(1e6).reproject(STAT_PROJ).rename('area_km2');
+
+// Put ID fields first, image_label last if present; drop system props
+function reorderColumns(fc, keepFirst) {
+  keepFirst = ee.List(keepFirst);
+  var first = ee.Feature(fc.first());
+  var props = ee.List(first.propertyNames())
+    .removeAll(keepFirst)
+    .remove('system:index')
+    .remove('.geo');
+
+  var hasImageLabel = props.contains('image_label');
+  var propsNoImg = ee.List(ee.Algorithms.If(hasImageLabel, props.remove('image_label'), props));
+  var tail = ee.List(ee.Algorithms.If(hasImageLabel, ['image_label'], []));
+  var allCols = keepFirst.cat(propsNoImg).cat(tail);
+  return fc.select(allCols);
+}
+
+// Order + drop geometry (CSV-safe)
+function finalizeForExport(fc, keepFirst) {
+  var ordered = reorderColumns(fc, keepFirst);
+  var noGeom = ordered.map(function(f){ return ee.Feature(f).setGeometry(null); });
+  return ee.FeatureCollection(noGeom);
+}
+
+// Keep only specified metrics (IDs first, image_label last), drop geometry
+function slimForExport(fc, keepFirst, metricList) {
+  keepFirst  = ee.List(keepFirst);
+  metricList = ee.List(metricList);
+
+  var first  = ee.Feature(fc.first());
+  var props  = ee.List(first.propertyNames())
+    .remove('system:index')
+    .remove('.geo');
+
+  var hasImageLabel = props.contains('image_label');
+
+  var metricsAvailable = metricList
+    .map(function(m) {
+      m = ee.String(m);
+      return ee.Algorithms.If(props.contains(m), m, null);
+    })
+    .removeAll([null]);
+
+  var selectOrder = keepFirst
+    .cat(metricsAvailable)
+    .cat(ee.List(ee.Algorithms.If(hasImageLabel, ['image_label'], [])));
+
+  var selected = fc.select(selectOrder);
+  var noGeom   = selected.map(function(f){ return ee.Feature(f).setGeometry(null); });
+  return ee.FeatureCollection(noGeom);
+}
+
+/* =============================
+ * === PER-PROJECT DECAY =======
+ * ============================= */
+
+function decayedInfluenceForCode(codeStr) {
+  var project      = allProjects.filter(ee.Filter.eq('Project_co', codeStr));
+  var base         = costSurface.multiply(0).toByte();
+  var sourceRaster = base.paint(project, 1).selfMask();
+  var rawCost      = costSurface.cumulativeCost({ source: sourceRaster, maxDistance: maxDist });
+  return rawCost.multiply(-k).exp()
+    .subtract(decayAtMax)
+    .multiply(scaleFactor)
+    .updateMask(rawCost.lt(maxDist))
+    .toFloat();
+}
+
+/* ========================================
+ * === ALL-PROJECTS ACD / HM / PII ========
+ * ======================================== */
+
+var costImages = codesToUse.map(function(code) {
+  code = ee.String(code);
+  return decayedInfluenceForCode(code).rename('cost');
+});
+
+var coll    = ee.ImageCollection.fromImages(costImages);
+var invColl = coll.map(function(img){ return ee.Image(1).subtract(ee.Image(img)).unmask(1); });
+var prod    = invColl.reduce(ee.Reducer.product());
+
+var oneEA = ee.Image.constant(1).toFloat().reproject({ crs: WORK_PROJ, scale: WORK_SCALE });
+
+var africaCostDistance = oneEA.subtract(prod).updateMask(prod.lt(1)).rename('Africa_ACD');
+
+var maxHM = HM.reduceRegion({
+  reducer: ee.Reducer.max(), geometry: africaRegion, scale: 100, bestEffort: true, tileScale: 16
+});
+var maxHMValue = ee.Number(maxHM.values().get(0));
+
+var HM_norm = ee.Image(ee.Algorithms.If(maxHMValue.lte(1), HM, HM.divide(maxHMValue)))
+  .clamp(0,1).rename('HM_norm').clip(africaRegion).reproject({ crs: WORK_PROJ, scale: WORK_SCALE });
+
+var Afr_ACD_HM = oneEA.subtract(oneEA.subtract(africaCostDistance).multiply(oneEA.subtract(HM_norm)))
+  .rename('Africa_ACD_HM');
+
+/* ==================================================================
+ * === CACHES: PROJECT & CORRIDOR ACD / PII =========================
+ * ================================================================== */
+
+var acdList   = ee.ImageCollection.fromImages(costImages).toList(codesToUse.size());
+var acdByCode = ee.Dictionary.fromLists(codesToUse, acdList);
+
+var piiList = codesToUse.map(function(code){
+  code = ee.String(code);
+  var acd = ee.Image(acdByCode.get(code));
+  var pii = ee.Image(1).subtract(ee.Image(1).subtract(acd).multiply(ee.Image(1).subtract(HM_norm)))
+            .updateMask(acd.mask());
+  return pii.rename(code);
+});
+var piiByCode = ee.Dictionary.fromLists(codesToUse, ee.List(piiList));
+
+// Corridors (prefix from code letters)
+var prefixes = projectCodes
+  .map(function(code){ return ee.String(code).replace('([A-Za-z]+).*', '$1'); })
+  .distinct().sort();
+var testPrefixes = ee.List(prefixes).slice(0, TEST_N);
+
+var corrAcdList = prefixes.map(function(pref){
+  pref = ee.String(pref);
+  var corridorFC    = allProjects.filter(ee.Filter.stringStartsWith('Project_co', pref));
+  var corridorCodes = corridorFC.aggregate_array('Project_co').distinct();
+
+  var costImgs = ee.List(corridorCodes).map(function(code){
+    code = ee.String(code);
+    return ee.Image(acdByCode.get(code));
+  });
+
+  var ic   = ee.ImageCollection.fromImages(costImgs);
+  var inv  = ic.map(function(img){ return ee.Image(1).subtract(ee.Image(img)).unmask(1); });
+  var prod = inv.reduce(ee.Reducer.product());
+  return ee.Image(1).subtract(prod).updateMask(prod.lt(1)).rename(pref.cat('_ACD'));
+});
+var corrACDByPrefix = ee.Dictionary.fromLists(prefixes, corrAcdList);
+
+var corrPIIList = prefixes.map(function(pref){
+  pref = ee.String(pref);
+  var acdCorr = ee.Image(corrACDByPrefix.get(pref)).rename(pref.cat('_ACD'));
+  var piiCorr = ee.Image(1).subtract(ee.Image(1).subtract(acdCorr).multiply(ee.Image(1).subtract(HM_norm)))
+                .updateMask(acdCorr.mask()).rename(pref);
+  return piiCorr;
+});
+var corrPIIByPrefix = ee.Dictionary.fromLists(prefixes, corrPIIList);
+
+/* =============================
+ * === REGION-WISE SUMMARIES ===
+ * ============================= */
+
+var PCTS = [5, 25, 50, 75, 95];
+var INCLUDE_TRIMMED_MEAN = false;
+
+function safeDiv(n, d) {
+  return ee.Algorithms.If(
+    ee.Algorithms.IsEqual(d, null),
+    null,
+    ee.Algorithms.If(ee.Number(d).gt(0), ee.Number(n).divide(ee.Number(d)), null)
+  );
+}
+
+function summarizeOverRegions(img, label, regions, idFields) {
+  img = ee.Image(img).reproject(STAT_PROJ);
+  var x   = img.rename('x');
+  var pa  = PIXEL_AREA;
+
+  var validAreaImg    = pa.updateMask(x.mask()).rename('val');
+  var affectedAreaImg = pa.updateMask(x.gt(AFFECT_THRESH)).rename('aff');
+
+  var xMeanMask = x.updateMask(x.gt(MEAN_THRESH));
+  var w         = pa.updateMask(xMeanMask.mask()).rename('w');
+
+  var xArea = x.multiply(pa).updateMask(x.mask()).rename('xArea');
+  var pctReducer = ee.Reducer.percentile(PCTS);
+
+  var fc = ee.FeatureCollection(regions.map(function(feat) {
+    feat = ee.Feature(feat);
+    var geom = feat.geometry(ee.ErrorMargin(WORK_SCALE))
+                    .intersection(africaRegion, ee.ErrorMargin(WORK_SCALE));
+
+    var base = xMeanMask.reduceRegion({
+      reducer: ee.Reducer.mean()
+        .combine({reducer2: ee.Reducer.variance(), sharedInputs: true})
+        .combine({reducer2: ee.Reducer.count(), sharedInputs: true}),
+      geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true, tileScale: 16
+    });
+
+    var count    = ee.Number(base.get('x_count'));
+    var hasCount = count.gt(0);
+    var mean     = ee.Algorithms.If(hasCount, ee.Number(base.get('x_mean')), null);
+    var hasVar   = count.gt(1);
+    var variance = ee.Algorithms.If(hasVar, ee.Number(base.get('x_variance')), null);
+    var sd       = ee.Algorithms.If(hasVar, ee.Number(variance).sqrt(), null);
+    var se       = ee.Algorithms.If(hasVar, ee.Number(sd).divide(count.sqrt()), null);
+    var ciLo     = ee.Algorithms.If(hasVar, ee.Number(mean).subtract(ee.Number(se).multiply(1.96)), null);
+    var ciHi     = ee.Algorithms.If(hasVar, ee.Number(mean).add(ee.Number(se).multiply(1.96)), null);
+
+    var xw = xMeanMask.multiply(w).rename('xw');
+    var sums = xw.addBands(w).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true, tileScale: 16
+    });
+    var dSums = ee.Dictionary(sums);
+    var sumXW = ee.Number(ee.Algorithms.If(dSums.contains('xw'), dSums.get('xw'), 0));
+    var sumW  = ee.Number(ee.Algorithms.If(dSums.contains('w'),  dSums.get('w'),  0));
+    var aw    = ee.Number(safeDiv(sumXW, sumW));
+
+    var aDict = affectedAreaImg.addBands(validAreaImg).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true, tileScale: 16
+    });
+    aDict = ee.Dictionary(aDict);
+    var areaAffected = ee.Number(ee.Algorithms.If(aDict.contains('aff'), aDict.get('aff'), 0));
+    var areaValid    = ee.Number(ee.Algorithms.If(aDict.contains('val'), aDict.get('val'),  0));
+    var fracAffected = ee.Number(safeDiv(areaAffected, areaValid));
+
+    var total = xArea.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true, tileScale: 16
+    }).get('xArea');
+
+    var pct = x.reduceRegion({
+      reducer: pctReducer,
+      geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true, tileScale: 16
+    });
+
+    var out = ee.Feature(null, {});
+    idFields.forEach(function(k){ out = out.set(k, feat.get(k)); });
+
+    out = out.setMulti({
+      image_label        : label,
+      area_valid_km2     : areaValid,
+      area_affected_km2  : areaAffected,
+      fraction_affected  : fracAffected,
+      mean_thresh        : mean,
+      variance_thresh    : variance,
+      sd_thresh          : sd,
+      se_thresh          : se,
+      ci95_lo_thresh     : ciLo,
+      ci95_hi_thresh     : ciHi,
+      aw_mean_thresh     : aw,
+      total_value_km2    : total,
+      median             : ee.Dictionary(pct).get('x_p50'),
+      p05                : ee.Dictionary(pct).get('x_p5'),
+      p25                : ee.Dictionary(pct).get('x_p25'),
+      p75                : ee.Dictionary(pct).get('x_p75'),
+      p95                : ee.Dictionary(pct).get('x_p95')
+    });
+
+    return out;
+  }));
+
+  return fc;
+}
+
+/* =============================
+ * === BUILD REGION TABLES =====
+ * ============================= */
+
+var Countries = LSIB.select([COUNTRY_NAME_FIELD, 'wld_rgn'])
+  .filter(ee.Filter.eq('wld_rgn','Africa'));
+var WDPA_Africa = WDPA.select(WDPA_KEEP_FIELDS);
+
+var countryHM   = summarizeOverRegions(HM_norm,            'HM_norm', Countries,  [COUNTRY_NAME_FIELD]);
+var countryACD  = summarizeOverRegions(africaCostDistance, 'ACD',     Countries,  [COUNTRY_NAME_FIELD]);
+var countryMix  = summarizeOverRegions(Afr_ACD_HM,         'ACD_HM',  Countries,  [COUNTRY_NAME_FIELD]);
+
+var wdpaHM      = summarizeOverRegions(HM_norm,            'HM_norm', WDPA_Africa, WDPA_KEEP_FIELDS);
+var wdpaACD     = summarizeOverRegions(africaCostDistance, 'ACD',     WDPA_Africa, WDPA_KEEP_FIELDS);
+var wdpaMix     = summarizeOverRegions(Afr_ACD_HM,         'ACD_HM',  WDPA_Africa, WDPA_KEEP_FIELDS);
+
+// Order: IDs first, image_label last
+countryHM  = reorderColumns(countryHM,  [COUNTRY_NAME_FIELD]);
+countryACD = reorderColumns(countryACD, [COUNTRY_NAME_FIELD]);
+countryMix = reorderColumns(countryMix, [COUNTRY_NAME_FIELD]);
+
+wdpaHM  = reorderColumns(wdpaHM,  WDPA_KEEP_FIELDS);
+wdpaACD = reorderColumns(wdpaACD, WDPA_KEEP_FIELDS);
+wdpaMix = reorderColumns(wdpaMix, WDPA_KEEP_FIELDS);
+
+/* =============================
+ * === PER-PROJECT / CORRIDOR ==
+ * ============================= */
+
+function summarizeImageOneRow(img, label, idKey, idVal, geom, includePcts) {
+  img = ee.Image(img).reproject(STAT_PROJ);
+  var x  = img.rename('x');
+  var pa = ee.Image(PIXEL_AREA);
+
+  var validAreaImg    = pa.updateMask(x.mask()).rename('val');
+  var affectedAreaImg = pa.updateMask(x.gt(AFFECT_THRESH)).rename('aff');
+
+  var xMeanMask = x.updateMask(x.gt(MEAN_THRESH));
+  var w         = pa.updateMask(xMeanMask.mask()).rename('w');
+
+  var xArea = x.multiply(pa).updateMask(x.mask()).rename('xArea');
+
+  var base = xMeanMask.reduceRegion({
+    reducer: ee.Reducer.mean()
+      .combine({reducer2: ee.Reducer.variance(), sharedInputs: true})
+      .combine({reducer2: ee.Reducer.count(), sharedInputs: true}),
+    geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, tileScale: 16, bestEffort: true
+  });
+
+  var count    = ee.Number(base.get('x_count'));
+  var hasCount = count.gt(0);
+  var mean     = ee.Algorithms.If(hasCount, ee.Number(base.get('x_mean')), null);
+  var hasVar   = count.gt(1);
+  var variance = ee.Algorithms.If(hasVar, ee.Number(base.get('x_variance')), null);
+  var sd       = ee.Algorithms.If(hasVar, ee.Number(variance).sqrt(), null);
+  var se       = ee.Algorithms.If(hasVar, ee.Number(sd).divide(count.sqrt()), null);
+  var ciLo     = ee.Algorithms.If(hasVar, ee.Number(mean).subtract(ee.Number(se).multiply(1.96)), null);
+  var ciHi     = ee.Algorithms.If(hasVar, ee.Number(mean).add(ee.Number(se).multiply(1.96)), null);
+
+  var xw   = xMeanMask.multiply(w).rename('xw');
+  var sums = xw.addBands(w).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, tileScale: 16, bestEffort: true
+  });
+  var dSums = ee.Dictionary(sums);
+  var sumXW = ee.Number(ee.Algorithms.If(dSums.contains('xw'), dSums.get('xw'), 0));
+  var sumW  = ee.Number(ee.Algorithms.If(dSums.contains('w'),  dSums.get('w'),  0));
+  var aw    = ee.Number(safeDiv(sumXW, sumW));
+
+  var aDict = affectedAreaImg.addBands(validAreaImg).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true
+  });
+  aDict = ee.Dictionary(aDict);
+  var areaAffected = ee.Number(ee.Algorithms.If(aDict.contains('aff'), aDict.get('aff'), 0));
+  var areaValid    = ee.Number(ee.Algorithms.If(aDict.contains('val'), aDict.get('val'),  0));
+  var fracAffected = ee.Number(safeDiv(areaAffected, areaValid));
+
+  var total = xArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true
+  }).get('xArea');
+
+  var pct = ee.Dictionary({});
+  if (includePcts) {
+    pct = ee.Dictionary(x.reduceRegion({
+      reducer: ee.Reducer.percentile(PCTS),
+      geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true
+    }));
+  }
+
+  var out = ee.Feature(null, {})
+    .set(idKey, idVal)
+    .set('image_label', label)
+    .set('area_valid_km2',    areaValid)
+    .set('area_affected_km2', areaAffected)
+    .set('fraction_affected', fracAffected)
+    .set('mean_thresh',   mean)
+    .set('variance_thresh', variance)
+    .set('sd_thresh',     sd)
+    .set('se_thresh',     se)
+    .set('ci95_lo_thresh',ciLo)
+    .set('ci95_hi_thresh',ciHi)
+    .set('aw_mean_thresh',aw)
+    .set('total_value_km2',   total)
+    .set('median', includePcts ? pct.get('x_p50') : null)
+    .set('p05',    includePcts ? pct.get('x_p5')  : null)
+    .set('p25',    includePcts ? pct.get('x_p25') : null)
+    .set('p75',    includePcts ? pct.get('x_p75') : null)
+    .set('p95',    includePcts ? pct.get('x_p95') : null);
+
+  return out;
+}
+
+function buildProjectTables(codeList, includePcts) {
+  var rows = ee.List(codeList).map(function(code){
+    code = ee.String(code);
+    var acd  = ee.Image(acdByCode.get(code)).rename('ACD_proj');
+    var pii  = ee.Image(piiByCode.get(code)).rename('PII_proj');
+    var hmIn = HM_norm.updateMask(acd.mask()).rename('HM_in_proj');
+
+    var projGeom = allProjects.filter(ee.Filter.eq('Project_co', code))
+                     .geometry(ee.ErrorMargin(WORK_SCALE))
+                     .buffer(maxDist)
+                     .intersection(africaRegion, ee.ErrorMargin(WORK_SCALE));
+
+    return ee.Dictionary({
+      code: code,
+      featHM : summarizeImageOneRow(hmIn, 'HM_norm_in_project', 'project_code', code, projGeom, includePcts),
+      featACD: summarizeImageOneRow(acd,  'ACD_project',        'project_code', code, projGeom, includePcts),
+      featPII: summarizeImageOneRow(pii,  'ACD_HM_project',     'project_code', code, projGeom, includePcts)
+    });
+  });
+
+  rows = ee.List(rows);
+  var HM  = ee.FeatureCollection(rows.map(function(d){ return ee.Dictionary(d).get('featHM');  }));
+  var ACD = ee.FeatureCollection(rows.map(function(d){ return ee.Dictionary(d).get('featACD'); }));
+  var PII = ee.FeatureCollection(rows.map(function(d){ return ee.Dictionary(d).get('featPII'); }));
+
+  HM  = reorderColumns(HM,  ['project_code']);
+  ACD = reorderColumns(ACD, ['project_code']);
+  PII = reorderColumns(PII, ['project_code']);
+
+  return { HM: HM, ACD: ACD, PII: PII };
+}
+
+function buildCorridorTables(prefList, includePcts) {
+  var rows = ee.List(prefList).map(function(pref){
+    pref = ee.String(pref);
+
+    var corridorFC = allProjects.filter(ee.Filter.stringStartsWith('Project_co', pref));
+    var acdCorr    = ee.Image(corrACDByPrefix.get(pref)).rename('ACD_corr');
+    var piiCorr    = ee.Image(corrPIIByPrefix.get(pref)).rename('PII_corr');
+    var hmCorr     = HM_norm.updateMask(acdCorr.mask()).rename('HM_in_corr');
+
+    var corrGeom = corridorFC.geometry(ee.ErrorMargin(WORK_SCALE))
+                     .buffer(maxDist)
+                     .intersection(africaRegion, ee.ErrorMargin(WORK_SCALE));
+
+    return ee.Dictionary({
+      pref: pref,
+      featHM : summarizeImageOneRow(hmCorr, 'HM_norm_in_corridor', 'corridor_id', pref, corrGeom, includePcts),
+      featACD: summarizeImageOneRow(acdCorr,'ACD_corridor',        'corridor_id', pref, corrGeom, includePcts),
+      featPII: summarizeImageOneRow(piiCorr,'ACD_HM_corridor',     'corridor_id', pref, corrGeom, includePcts)
+    });
+  });
+
+  rows = ee.List(rows);
+  var HM  = ee.FeatureCollection(rows.map(function(d){ return ee.Dictionary(d).get('featHM');  }));
+  var ACD = ee.FeatureCollection(rows.map(function(d){ return ee.Dictionary(d).get('featACD'); }));
+  var PII = ee.FeatureCollection(rows.map(function(d){ return ee.Dictionary(d).get('featPII'); }));
+
+  HM  = reorderColumns(HM,  ['corridor_id']);
+  ACD = reorderColumns(ACD, ['corridor_id']);
+  PII = reorderColumns(PII, ['corridor_id']);
+
+  return { HM: HM, ACD: ACD, PII: PII };
+}
+
+/* ===============================================
+ * === WIDE TABLES: Project / Corridor over regions
+ * =============================================== */
+
+var PII_THRESH = MEAN_THRESH;
+
+function catBandsFromList(imgList) {
+  imgList = ee.List(imgList);
+  var first = ee.Image(imgList.get(0));
+  var rest  = imgList.slice(1);
+  return ee.Image(rest.iterate(function(img, acc){
+    return ee.Image(acc).addBands(ee.Image(img));
+  }, first));
+}
+
+var projectIds = codesToUse;
+var projectPIIs = projectIds.map(function(code){
+  code = ee.String(code);
+  return ee.Image(piiByCode.get(code)).rename(code);
+});
+
+var projectMetricImgs = ee.List(projectIds).map(function(id){
+  id = ee.String(id);
+  var pii = ee.Image(ee.List(projectPIIs).get(ee.List(projectIds).indexOf(id)));
+  var thrMask = pii.gte(PII_THRESH);
+  var valMask = pii.mask();
+  var aff = ee.Image(PIXEL_AREA).updateMask(thrMask).rename(id.cat('_aff'));
+  var val = ee.Image(PIXEL_AREA).updateMask(valMask).rename(id.cat('_val'));
+  var xw  = pii.multiply(PIXEL_AREA).updateMask(thrMask).rename(id.cat('_xw'));
+  var w   = ee.Image(PIXEL_AREA).updateMask(thrMask).rename(id.cat('_w'));
+  var tot = pii.multiply(PIXEL_AREA).updateMask(valMask).rename(id.cat('_tot'));
+  return aff.addBands(val).addBands(xw).addBands(w).addBands(tot);
+});
+var projMetricsImg = catBandsFromList(projectMetricImgs);
+
+var corridorIds = prefixes;
+var corrPIIs = corridorIds.map(function(pref){
+  pref = ee.String(pref);
+  return ee.Image(corrPIIByPrefix.get(pref)).rename(pref);
+});
+
+var corridorMetricImgs = ee.List(corridorIds).map(function(id){
+  id = ee.String(id);
+  var pii = ee.Image(ee.List(corrPIIs).get(ee.List(corridorIds).indexOf(id)));
+  var thrMask = pii.gte(PII_THRESH);
+  var valMask = pii.mask();
+  var aff = ee.Image(PIXEL_AREA).updateMask(thrMask).rename(id.cat('_aff'));
+  var val = ee.Image(PIXEL_AREA).updateMask(valMask).rename(id.cat('_val'));
+  var xw  = pii.multiply(PIXEL_AREA).updateMask(thrMask).rename(id.cat('_xw'));
+  var w   = ee.Image(PIXEL_AREA).updateMask(thrMask).rename(id.cat('_w'));
+  var tot = pii.multiply(PIXEL_AREA).updateMask(valMask).rename(id.cat('_tot'));
+  return aff.addBands(val).addBands(xw).addBands(w).addBands(tot);
+});
+var corrMetricsImg = catBandsFromList(corridorMetricImgs);
+
+// Reduce over WDPA and Countries
+var wdpaBase = WDPA_Africa;
+var countryBase = Countries.select([COUNTRY_NAME_FIELD]);
+
+var wdpaProjSums = projMetricsImg.reduceRegions({
+  collection: wdpaBase, reducer: ee.Reducer.sum(), scale: WORK_SCALE, tileScale: 16, maxPixelsPerRegion: 1e12
+});
+var wdpaCorrSums = corrMetricsImg.reduceRegions({
+  collection: wdpaBase, reducer: ee.Reducer.sum(), scale: WORK_SCALE, tileScale: 16, maxPixelsPerRegion: 1e12
+});
+
+var ctryProjSums = projMetricsImg.reduceRegions({
+  collection: countryBase, reducer: ee.Reducer.sum(), scale: WORK_SCALE, tileScale: 16, maxPixelsPerRegion: 1e12
+});
+var ctryCorrSums = corrMetricsImg.reduceRegions({
+  collection: countryBase, reducer: ee.Reducer.sum(), scale: WORK_SCALE, tileScale: 16, maxPixelsPerRegion: 1e12
+});
+
+// Derive metrics; IDs first
+function addDerivedWideMetrics(fcSums, ids, idFields) {
+  ids = ee.List(ids);
+  var NAN = ee.Number(0).divide(0);
+
+  return ee.FeatureCollection(fcSums.map(function(f){
+    f = ee.Feature(f);
+
+    var out = ee.Feature(null, {});
+    idFields.forEach(function(k){ out = out.set(k, f.get(k)); });
+
+    function getNum(prop){
+      var has = f.propertyNames().contains(prop);
+      var val = ee.Algorithms.If(has, f.get(prop), null);
+      var isNull = ee.Algorithms.IsEqual(val, null);
+      return ee.Number(ee.Algorithms.If(isNull, 0, val));
+    }
+
+    var props = ids.iterate(function(id, acc){
+      id = ee.String(id);
+      acc = ee.Dictionary(acc);
+
+      var aff = getNum(id.cat('_aff'));
+      var val = getNum(id.cat('_val'));
+      var xw  = getNum(id.cat('_xw'));
+      var w   = getNum(id.cat('_w'));
+      var tot = getNum(id.cat('_tot'));
+
+      var frac = ee.Algorithms.If(val.gt(0), aff.divide(val), NAN);
+      var aw   = ee.Algorithms.If(w.gt(0),   xw.divide(w),   NAN);
+
+      return acc
+        .set(id.cat('_fraction_affected'), frac)
+        .set(id.cat('_aw_mean_thresh'),    aw)
+        .set(id.cat('_total_value_km2'),   tot);
+    }, ee.Dictionary({}));
+
+    return out.setMulti(ee.Dictionary(props));
+  }));
+}
+
+var WDPA_project_wide   = addDerivedWideMetrics(wdpaProjSums, projectIds, WDPA_KEEP_FIELDS);
+var WDPA_corridors_wide = addDerivedWideMetrics(wdpaCorrSums, corridorIds, WDPA_KEEP_FIELDS);
+var COUNTRY_project_wide   = addDerivedWideMetrics(ctryProjSums, projectIds, [COUNTRY_NAME_FIELD]);
+var COUNTRY_corridors_wide = addDerivedWideMetrics(ctryCorrSums, corridorIds, [COUNTRY_NAME_FIELD]);
+
+WDPA_project_wide      = reorderColumns(WDPA_project_wide, WDPA_KEEP_FIELDS);
+WDPA_corridors_wide    = reorderColumns(WDPA_corridors_wide, WDPA_KEEP_FIELDS);
+COUNTRY_project_wide   = reorderColumns(COUNTRY_project_wide, [COUNTRY_NAME_FIELD]);
+COUNTRY_corridors_wide = reorderColumns(COUNTRY_corridors_wide, [COUNTRY_NAME_FIELD]);
+
+/* =============================
+ * === TEST EXPORTS (FULL METRICS)
+ * ============================= */
+
+var TEST_FOLDER = 'GEE_Exports';
+
+var countryHM_TEST   = finalizeForExport(countryHM.limit(TEST_N),  [COUNTRY_NAME_FIELD]);
+var countryACD_TEST  = finalizeForExport(countryACD.limit(TEST_N), [COUNTRY_NAME_FIELD]);
+var countryMix_TEST  = finalizeForExport(countryMix.limit(TEST_N), [COUNTRY_NAME_FIELD]);
+
+var wdpaHM_TEST      = finalizeForExport(wdpaHM.limit(TEST_N),  WDPA_KEEP_FIELDS);
+var wdpaACD_TEST     = finalizeForExport(wdpaACD.limit(TEST_N), WDPA_KEEP_FIELDS);
+var wdpaMix_TEST     = finalizeForExport(wdpaMix.limit(TEST_N),  WDPA_KEEP_FIELDS);
+
+var projectTables_TEST  = buildProjectTables(testCodes, /*includePcts=*/false);
+var projHM_TEST         = finalizeForExport(projectTables_TEST.HM,  ['project_code']);
+var projACD_TEST        = finalizeForExport(projectTables_TEST.ACD, ['project_code']);
+var projPII_TEST        = finalizeForExport(projectTables_TEST.PII, ['project_code']);
+
+var corridorTables_TEST = buildCorridorTables(testPrefixes, /*includePcts=*/false);
+var corrHM_TEST         = finalizeForExport(corridorTables_TEST.HM,  ['corridor_id']);
+var corrACD_TEST        = finalizeForExport(corridorTables_TEST.ACD, ['corridor_id']);
+var corrPII_TEST        = finalizeForExport(corridorTables_TEST.PII, ['corridor_id']);
+
+// WIDE tests (ordered, no geometry)
+var WDPA_project_wide_TEST      = finalizeForExport(WDPA_project_wide.limit(TEST_N),      WDPA_KEEP_FIELDS);
+var WDPA_corridors_wide_TEST    = finalizeForExport(WDPA_corridors_wide.limit(TEST_N),    WDPA_KEEP_FIELDS);
+var COUNTRY_project_wide_TEST   = finalizeForExport(COUNTRY_project_wide.limit(TEST_N),   [COUNTRY_NAME_FIELD]);
+var COUNTRY_corridors_wide_TEST = finalizeForExport(COUNTRY_corridors_wide.limit(TEST_N), [COUNTRY_NAME_FIELD]);
+
+// --- SENS export wrapper in use (was Export.table.toDrive({...})) ---
+X('TESTN_CountryStats_HM_norm',  countryHM_TEST,  TEST_FOLDER);
+X('TESTN_CountryStats_ACD',      countryACD_TEST, TEST_FOLDER);
+X('TESTN_CountryStats_ACD_HM',   countryMix_TEST, TEST_FOLDER);
+
+X('TESTN_WDPA_Africa_Stats_HM_norm', wdpaHM_TEST,  TEST_FOLDER);
+X('TESTN_WDPA_Africa_Stats_ACD',     wdpaACD_TEST, TEST_FOLDER);
+X('TESTN_WDPA_Africa_Stats_ACD_HM',  wdpaMix_TEST, TEST_FOLDER);
+
+X('TESTN_ProjectStats_HM_norm_influence', projHM_TEST,  TEST_FOLDER);
+X('TESTN_ProjectStats_ACD',               projACD_TEST, TEST_FOLDER);
+X('TESTN_ProjectStats_ACD_HM',            projPII_TEST, TEST_FOLDER);
+
+X('TESTN_CorridorStats_HM_norm_influence', corrHM_TEST,  TEST_FOLDER);
+X('TESTN_CorridorStats_ACD',               corrACD_TEST, TEST_FOLDER);
+X('TESTN_CorridorStats_ACD_HM',            corrPII_TEST, TEST_FOLDER);
+
+X('TESTN_WDPA_project_PIIwide',      WDPA_project_wide_TEST,      TEST_FOLDER);
+X('TESTN_WDPA_corridors_PIIwide',    WDPA_corridors_wide_TEST,    TEST_FOLDER);
+X('TESTN_COUNTRY_project_PIIwide',   COUNTRY_project_wide_TEST,   TEST_FOLDER);
+X('TESTN_COUNTRY_corridors_PIIwide', COUNTRY_corridors_wide_TEST, TEST_FOLDER);
+
+/* =============================
+ * === SLIM METRICS (FULL ONLY)
+ * ============================= */
+
+var SLIM_METRICS = [
+  'area_valid_km2',
+  'area_affected_km2',
+  'fraction_affected',
+  'mean_thresh',
+  'total_value_km2'
+];
+
+/* ============================================
+ * === COMBINE TALL (HM/ACD/ACHM) INTO WIDE ===
+ * ============================================ */
+// Combine 3 slim “tall” tables (HM, ACD, ACHM) into one wide table by key fields.
+// Each FC must include: the ID fields, 'image_label' ∈ {'HM_norm','ACD','ACD_HM'},
+// and metrics: 'mean_thresh', 'total_value_km2'.
+function combineThreeTall(HM_fc, ACD_fc, ACHM_fc, idFields) {
+  // idFields MUST be a plain JS array (e.g., ['project_code'] or WDPA_KEEP_FIELDS)
+  var idKeys = idFields;
+
+  // Build a composite ee.Filter that matches all id keys for a given target feature
+  function buildEqFilter(target) {
+    target = ee.Feature(target);
+    var f = ee.Filter.eq(idKeys[0], target.get(idKeys[0]));
+    for (var i = 1; i < idKeys.length; i++) {
+      f = ee.Filter.and(f, ee.Filter.eq(idKeys[i], target.get(idKeys[i])));
+    }
+    return f;
+  }
+
+  var ACD_fc_cached  = ee.FeatureCollection(ACD_fc);
+  var ACHM_fc_cached = ee.FeatureCollection(ACHM_fc);
+
+  var combined = ee.FeatureCollection(ee.FeatureCollection(HM_fc).map(function(hmFeat){
+    hmFeat = ee.Feature(hmFeat);
+    var filt = buildEqFilter(hmFeat);
+    var acd  = ee.Feature(ACD_fc_cached.filter(filt).first());
+    var achm = ee.Feature(ACHM_fc_cached.filter(filt).first());
+
+    function g(feat, prop){ return ee.Algorithms.If(feat, feat.get(prop), null); }
+
+    var out = ee.Feature(null, {});
+    // Set ID fields first
+    idKeys.forEach(function(k){ out = out.set(k, hmFeat.get(k)); });
+
+    // Attach metrics
+    out = out.setMulti({
+      HM_mean_thresh   : g(hmFeat, 'mean_thresh'),
+      HM_total_km2     : g(hmFeat, 'total_value_km2'),
+      ACD_mean_thresh  : g(acd,    'mean_thresh'),
+      ACD_total_km2    : g(acd,    'total_value_km2'),
+      ACHM_mean_thresh : g(achm,   'mean_thresh'),
+      ACHM_total_km2   : g(achm,   'total_value_km2')
+    });
+
+    return out;
+  }));
+
+  return combined;
+}
+
+
+/* ===============================================
+ * === FULL EXPORTS (COMBINED; SLIMMED) ===========
+ * =============================================== */
+
+var FULL_FOLDER = 'GEE_Exports';
+
+// Build slim “tall” tables (unchanged logic)
+var countryHM_FULL  = slimForExport(countryHM,  [COUNTRY_NAME_FIELD], SLIM_METRICS);
+var countryACD_FULL = slimForExport(countryACD, [COUNTRY_NAME_FIELD], SLIM_METRICS);
+var countryMix_FULL = slimForExport(countryMix, [COUNTRY_NAME_FIELD], SLIM_METRICS);
+
+var wdpaHM_FULL  = slimForExport(wdpaHM,  WDPA_KEEP_FIELDS, SLIM_METRICS);
+var wdpaACD_FULL = slimForExport(wdpaACD, WDPA_KEEP_FIELDS, SLIM_METRICS);
+var wdpaMix_FULL = slimForExport(wdpaMix, WDPA_KEEP_FIELDS, SLIM_METRICS);
+
+var projectTables_FULL = buildProjectTables(codesToUse, /*includePcts=*/true);
+var projHM_FULL        = slimForExport(projectTables_FULL.HM,  ['project_code'], SLIM_METRICS);
+var projACD_FULL       = slimForExport(projectTables_FULL.ACD, ['project_code'], SLIM_METRICS);
+var projPII_FULL       = slimForExport(projectTables_FULL.PII, ['project_code'], SLIM_METRICS);
+
+var corridorTables_FULL = buildCorridorTables(prefixes, /*includePcts=*/true);
+var corrHM_FULL         = slimForExport(corridorTables_FULL.HM,  ['corridor_id'], SLIM_METRICS);
+var corrACD_FULL        = slimForExport(corridorTables_FULL.ACD, ['corridor_id'], SLIM_METRICS);
+var corrPII_FULL        = slimForExport(corridorTables_FULL.PII, ['corridor_id'], SLIM_METRICS);
+
+// === NEW: one combined CSV per entity (Country / WDPA / Project / Corridor) ===
+var CountryStats_COMBINED   = combineThreeTall(countryHM_FULL,  countryACD_FULL,  countryMix_FULL,  [COUNTRY_NAME_FIELD]);
+var WDPA_Africa_COMBINED    = combineThreeTall(wdpaHM_FULL,     wdpaACD_FULL,     wdpaMix_FULL,     WDPA_KEEP_FIELDS);
+var ProjectStats_COMBINED   = combineThreeTall(projHM_FULL,     projACD_FULL,     projPII_FULL,     ['project_code']);
+var CorridorStats_COMBINED  = combineThreeTall(corrHM_FULL,     corrACD_FULL,     corrPII_FULL,     ['corridor_id']);
+
+// Enforce ID-first, no geometry; then export the combined CSVs
+var CountryStats_COMBINED_OUT  = finalizeForExport(CountryStats_COMBINED,  [COUNTRY_NAME_FIELD]);
+var WDPA_Africa_COMBINED_OUT   = finalizeForExport(WDPA_Africa_COMBINED,   WDPA_KEEP_FIELDS);
+var ProjectStats_COMBINED_OUT  = finalizeForExport(ProjectStats_COMBINED,  ['project_code']);
+var CorridorStats_COMBINED_OUT = finalizeForExport(CorridorStats_COMBINED, ['corridor_id']);
+
+X('CountryStats_COMBINED',  CountryStats_COMBINED_OUT,  FULL_FOLDER);
+X('WDPA_Africa_Stats_COMBINED', WDPA_Africa_COMBINED_OUT, FULL_FOLDER);
+X('ProjectStats_COMBINED',  ProjectStats_COMBINED_OUT,  FULL_FOLDER);
+X('CorridorStats_COMBINED', CorridorStats_COMBINED_OUT, FULL_FOLDER);
+
+// Keep the WIDE tables (PIIwide) exactly as before
+var WDPA_project_wide_FULL      = finalizeForExport(WDPA_project_wide,      WDPA_KEEP_FIELDS);
+var WDPA_corridors_wide_FULL    = finalizeForExport(WDPA_corridors_wide,    WDPA_KEEP_FIELDS);
+var COUNTRY_project_wide_FULL   = finalizeForExport(COUNTRY_project_wide,   [COUNTRY_NAME_FIELD]);
+var COUNTRY_corridors_wide_FULL = finalizeForExport(COUNTRY_corridors_wide, [COUNTRY_NAME_FIELD]);
+
+X('WDPA_project_PIIwide',      WDPA_project_wide_FULL,      FULL_FOLDER);
+X('WDPA_corridors_PIIwide',    WDPA_corridors_wide_FULL,    FULL_FOLDER);
+X('COUNTRY_project_PIIwide',   COUNTRY_project_wide_FULL,   FULL_FOLDER);
+X('COUNTRY_corridors_PIIwide', COUNTRY_corridors_wide_FULL, FULL_FOLDER);
+
+/* =======================================================
+ * === WDPA_flat Country Combined Stats (one CSV) ========
+ * ======================================================= */
+
+// Expect: WDPA_flat is a FeatureCollection with a string field 'country'
+var WDPA_FLAT = ee.FeatureCollection(WDPA_flat);
+
+// Build one geometry per unique country in WDPA_flat
+var WDPAflat_country_names = WDPA_FLAT.aggregate_array('country').distinct().sort();
+
+var WDPAflat_countries = ee.FeatureCollection(WDPAflat_country_names.map(function(name){
+  name = ee.String(name);
+  var geom = WDPA_FLAT
+    .filter(ee.Filter.eq('country', name))
+    .geometry(ee.ErrorMargin(WORK_SCALE))
+    .intersection(africaRegion, ee.ErrorMargin(WORK_SCALE));
+  return ee.Feature(geom).set('Country', name);
+}));
+
+// Helper: compute mean_thresh (area-weighted, masked at x > MEAN_THRESH) and total_value_km2
+function meanAndTotalFor(img, geom){
+  img = ee.Image(img).reproject(STAT_PROJ);
+  var x  = img.rename('x');
+  var pa = PIXEL_AREA;
+
+  // mean_thresh: area-weighted mean using MEAN_THRESH mask
+  var xMeanMask = x.updateMask(x.gt(MEAN_THRESH));
+  var w   = pa.updateMask(xMeanMask.mask()).rename('w');
+  var xw  = xMeanMask.multiply(w).rename('xw');
+
+  var sums = xw.addBands(w).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true, tileScale: 16
+  });
+  var dSums = ee.Dictionary(sums);
+  var sumXW = ee.Number(ee.Algorithms.If(dSums.contains('xw'), dSums.get('xw'), 0));
+  var sumW  = ee.Number(ee.Algorithms.If(dSums.contains('w'),  dSums.get('w'),  0));
+  var aw    = ee.Algorithms.If(sumW.gt(0), sumXW.divide(sumW), null);
+
+  // total_value_km2: sum(x * area) over all valid pixels
+  var total = x.multiply(pa).updateMask(x.mask()).rename('xArea').reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom, scale: WORK_SCALE, maxPixels: 1e13, bestEffort: true, tileScale: 16
+  }).get('xArea');
+
+  return ee.Dictionary({ mean_thresh: aw, total_km2: total });
+}
+
+// Compute HM, ACD, and ACD_HM stats per WDPA_flat country geometry
+var WDPAflat_Country_Combined = ee.FeatureCollection(WDPAflat_countries.map(function(f){
+  f = ee.Feature(f);
+  var geom = f.geometry();
+
+  var hm   = meanAndTotalFor(HM_norm,            geom);
+  var acd  = meanAndTotalFor(africaCostDistance, geom);
+  var achm = meanAndTotalFor(Afr_ACD_HM,         geom);
+
+  // One row per country with all six requested columns
+  return ee.Feature(null, {
+    Country              : f.get('Country'),
+    HM_mean_thresh       : hm.get('mean_thresh'),
+    HM_total_km2         : hm.get('total_km2'),
+    ACD_mean_thresh      : acd.get('mean_thresh'),
+    ACD_total_km2        : acd.get('total_km2'),
+    ACHM_mean_thresh     : achm.get('mean_thresh'),
+    ACHM_total_km2       : achm.get('total_km2')
+  });
+}));
+
+// Ensure clean column order + no geometry, then export (uses your SENS-aware X())
+var WDPAflat_Country_Combined_OUT = finalizeForExport(WDPAflat_Country_Combined, ['Country']);
+X('WDPAflat_Country_CombinedStats', WDPAflat_Country_Combined_OUT, /*folder=*/'GEE_Exports');
+
+/* ============================================================
+ * === KBAbyISO3 Country Combined Stats (geometry-based) ======
+ * ===== Mirrors WDPA_flat block, grouped by ISO3 =============
+ * ============================================================ */
+
+// Expect: KBAbyISO3 is a FeatureCollection with a string field 'ISO3'
+var KBA_ISO = ee.FeatureCollection(KBAbyISO3);
+
+// Unique ISO3 codes (sorted)
+var isoList = KBA_ISO.aggregate_array('ISO3').distinct().sort();
+
+// Build one geometry per ISO3 by merging all KBA polygons with that code
+var KBA_ISO_geoms = ee.FeatureCollection(isoList.map(function(iso){
+  iso = ee.String(iso);
+  var geom = KBA_ISO
+    .filter(ee.Filter.eq('ISO3', iso))
+    .geometry(ee.ErrorMargin(WORK_SCALE))
+    .intersection(africaRegion, ee.ErrorMargin(WORK_SCALE));
+  return ee.Feature(geom).set('Country', iso);  // keep same output key name as WDPA_flat block
+}));
+
+// Reuse your geometry-based helper defined above:
+//   meanAndTotalFor(img, geom) -> { mean_thresh, total_km2 }
+
+// Compute HM, ACD, and ACD_HM stats per ISO3 geometry
+var KBAbyISO3_Country_Combined = ee.FeatureCollection(KBA_ISO_geoms.map(function(f){
+  f = ee.Feature(f);
+  var geom = f.geometry();
+
+  var hm   = meanAndTotalFor(HM_norm,            geom);
+  var acd  = meanAndTotalFor(africaCostDistance, geom);
+  var achm = meanAndTotalFor(Afr_ACD_HM,         geom);
+
+  return ee.Feature(null, {
+    Country              : f.get('Country'),      // ISO3 code
+    HM_mean_thresh       : hm.get('mean_thresh'),
+    HM_total_km2         : hm.get('total_km2'),
+    ACD_mean_thresh      : acd.get('mean_thresh'),
+    ACD_total_km2        : acd.get('total_km2'),
+    ACHM_mean_thresh     : achm.get('mean_thresh'),
+    ACHM_total_km2       : achm.get('total_km2')
+  });
+}));
+
+// Order columns & drop geometry; export (uses your SENS-aware X() wrapper)
+var KBAbyISO3_Country_Combined_OUT = finalizeForExport(KBAbyISO3_Country_Combined, ['Country']);
+X('KBAbyISO3_Country_CombinedStats', KBAbyISO3_Country_Combined_OUT, /*folder=*/'GEE_Exports');
+
