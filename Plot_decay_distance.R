@@ -1,3 +1,4 @@
+# This is a script created by Diego Juffe to pot the sensitivity analyses results of his PhD thesis. Script developed through August-September 2025.
 # Load libraries
 library(tidyverse)
 
@@ -61,3 +62,4 @@ print(decay_plot)
 # Export to PNG with white background
 ggsave("C:/R_scripts/PhD/Decay_Curves_Final_Clean.png", plot = decay_plot,
        width = 10, height = 6, dpi = 300, bg = "white")
+
