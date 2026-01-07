@@ -4,10 +4,10 @@ if (!requireNamespace("tidyverse", quietly = TRUE)) install.packages("tidyverse"
 library(tidyverse)
 
 # ============ SETTINGS ============
-CSV_PATH <- "C:/R_scripts/PhD/country_PII_conts.csv"  # path to your CSV file
-TOP_N <- 10                                       # number of countries to plot
+CSV_PATH <- "C:"  # path to your CSV file
+TOP_N <- 10      # number of countries to plot
 
-# ---- LABELS (customize freely) ----
+# ---- LABELS ----
 label_existing <- "Existing pressures contribution"
 label_new      <- "New pressures contribution"
 label_pii      <- "Potential Impact Intensity mean (PII) in Countries"
@@ -24,11 +24,6 @@ pal <- setNames(c("#1f77b4", "#ff7f0e"),
 # ---- READ DATA ----
 # CSV must have columns: Country, Existing, New, PII
 df <- read_csv(CSV_PATH, show_col_types = FALSE)
-
-# OPTIONAL: sanity checks (won't stop the script)
-if (!all(c("Country","Existing","New","PII") %in% names(df))) {
-  stop("CSV must contain columns: Country, Existing, New, PII")
-}
 
 # ---- SELECT TOP N ----
 df_top <- df %>%
@@ -87,4 +82,5 @@ output_file <- file.path(output_dir, paste0("fig_", TOP_N, "_", csv_name, ".png"
 
 ggsave(output_file, fig1, width = 10, height = png_height, dpi = 300)
 cat("??? Saved plot to:", output_file, "\n")
+
 
