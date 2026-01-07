@@ -1,6 +1,6 @@
 Below is a cut and paste of the script located here: https://code.earthengine.google.com/?scriptPath=users%2FDiegoJuffe74%2Ftests%3A00_THESIS_FINAL%2FFINAL_with_Sensitivity_analysis
 
-/***** SENSITIVITY HEADER (drop-in; tweak these per run) *****/
+/***** SENSITIVITY HEADER *****/
 
 // Pick ONE setup per run
 var SENS = {
@@ -918,10 +918,6 @@ var WDPAflat_Country_Combined = ee.FeatureCollection(WDPAflat_countries.map(func
     ACHM_total_km2       : achm.get('total_km2')
   });
 }));
-
-// Ensure clean column order + no geometry, then export (uses your SENS-aware X())
-var WDPAflat_Country_Combined_OUT = finalizeForExport(WDPAflat_Country_Combined, ['Country']);
-X('WDPAflat_Country_CombinedStats', WDPAflat_Country_Combined_OUT, /*folder=*/'GEE_Exports');
 
 /* ============================================================
  * === KBAbyISO3 Country Combined Stats (geometry-based) ======
