@@ -81,6 +81,6 @@ csv_name <- tools::file_path_sans_ext(basename(CSV_PATH))
 output_file <- file.path(output_dir, paste0("fig_", TOP_N, "_", csv_name, ".png"))
 
 ggsave(output_file, fig1, width = 10, height = png_height, dpi = 300)
-cat("??? Saved plot to:", output_file, "\n")
+cat("Saved plot to:", output_file, "\n")
 
 
